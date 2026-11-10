@@ -1917,7 +1917,7 @@ impl NativeAgent {
 
         session
             .thread
-            .update(cx, |thread, cx| thread.cancel(cx))
+            .update(cx, |thread, cx| thread.cancel_all(cx))
             .detach();
         self.enqueue_save(session_id, draft_prompt, cx);
         let Some(session) = self.sessions.remove(session_id) else {

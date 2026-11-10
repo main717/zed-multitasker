@@ -2372,13 +2372,19 @@ impl Thread {
         }
     }
 
-    /// Stops this thread and every subagent it started. Used when the user
-    /// explicitly stops the thread.
+    /// Stops the in-flight model turn. Background subagents keep running, so a
+    /// new user message does not kill work they are still doing.
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        self.cancel_turn(cx)
+    }
+
+    /// Stops the turn and cancels every background subagent this thread started.
+    /// Reserved for teardown paths: session release and truncation.
+    pub fn cancel_all(&mut self, cx: &mut Context<Self>) -> Task<()> {
         for subagent in self.running_subagents.drain(..) {
             if let Some(subagent) = subagent.upgrade() {
                 subagent
-                    .update(cx, |thread, cx| thread.request_cancel(cx))
+                    .update(cx, |thread, cx| thread.cancel_all(cx))
                     .detach();
             }
         }
@@ -2386,9 +2392,7 @@ impl Thread {
         self.cancel_turn(cx)
     }
 
-    /// Stops only the in-flight model turn. Background subagents keep running,
-    /// so a new user message does not kill work they are still doing.
-    pub fn cancel_turn(&mut self, cx: &mut Context<Self>) -> Task<()> {
+    pub(crate) fn cancel_turn(&mut self, cx: &mut Context<Self>) -> Task<()> {
         let Some(running_turn) = self.running_turn.take() else {
             self.flush_pending_message(cx);
             self.flush_pending_reports(cx);
@@ -2501,7 +2505,7 @@ impl Thread {
         client_user_message_id: ClientUserMessageId,
         cx: &mut Context<Self>,
     ) -> Result<()> {
-        self.cancel(cx).detach();
+        self.cancel_all(cx).detach();
         self.advance_prompt_id();
         // Clear pending message since cancel will try to flush it asynchronously,
         // and we don't want that content to be added after we truncate

@@ -3734,27 +3734,16 @@ impl ThreadEnvironment for NativeThreadEnvironment {
     fn deliver_to_parent(&self, message: String, cx: &mut AsyncApp) -> Task<Result<()>> {
         let thread = self.thread.clone();
         cx.spawn(async move |cx| {
-            // Thread::send cancels a running turn, so wait for the parent to go
-            // idle first. A subagent finishing mid-turn must not kill the work
-            // the orchestrator is still streaming.
-            loop {
-                let idle = thread.read_with(cx, |thread, _cx| thread.is_turn_complete())?;
-                if idle {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(200))
-                    .await;
-            }
-
-            let events = thread.update(cx, |thread, cx| {
-                thread.send(ClientUserMessageId::new(), [message], cx)
-            })?;
-            let mut events = events?;
-            while let Ok(event) = events.recv().await {
-                if let Err(error) = event {
-                    log::error!("Background subagent report turn failed: {error:#}");
-                    break;
+            // Hand the report to the parent thread. If the orchestrator is mid-turn
+            // the report is queued and folded into the next turn, so finishing
+            // subagents never cancel the work the user is waiting on.
+            let events = thread.update(cx, |thread, cx| thread.deliver_report(message, cx))?;
+            if let Some(mut events) = events {
+                while let Ok(event) = events.recv().await {
+                    if let Err(error) = event {
+                        log::error!("Background subagent report turn failed: {error:#}");
+                        break;
+                    }
                 }
             }
             Ok(())
@@ -4387,7 +4376,9 @@ mod internal_tests {
     }
 
     #[gpui::test]
-    async fn test_explicit_subagent_model_ignores_configured_subagent_model(cx: &mut TestAppContext) {
+    async fn test_explicit_subagent_model_ignores_configured_subagent_model(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(path!("/test"), json!({})).await;

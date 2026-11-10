@@ -1316,6 +1316,10 @@ pub struct Thread {
     /// message mid-task; by default queued messages wait for the turn to finish.
     end_turn_at_next_boundary: bool,
     pending_message: Option<AgentMessage>,
+    /// Results of background subagents that finished while a turn was still
+    /// running. Delivered as a user message once the thread is idle, so a
+    /// report never cancels the turn the user is waiting on.
+    pending_reports: Vec<String>,
     pub(crate) tools: BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
     request_token_usage: HashMap<ClientUserMessageId, language_model::TokenUsage>,
     cumulative_token_usage: TokenUsage,
@@ -1467,6 +1471,7 @@ impl Thread {
             running_turn: None,
             end_turn_at_next_boundary: false,
             pending_message: None,
+            pending_reports: Vec::new(),
             tools: BTreeMap::default(),
             request_token_usage: HashMap::default(),
             cumulative_token_usage: TokenUsage::default(),
@@ -1843,6 +1848,7 @@ impl Thread {
             running_turn: None,
             end_turn_at_next_boundary: false,
             pending_message: None,
+            pending_reports: Vec::new(),
             tools: BTreeMap::default(),
             request_token_usage: db_thread.request_token_usage.clone(),
             cumulative_token_usage: db_thread.cumulative_token_usage,
@@ -2382,9 +2388,10 @@ impl Thread {
 
     /// Stops only the in-flight model turn. Background subagents keep running,
     /// so a new user message does not kill work they are still doing.
-    pub(crate) fn cancel_turn(&mut self, cx: &mut Context<Self>) -> Task<()> {
+    pub fn cancel_turn(&mut self, cx: &mut Context<Self>) -> Task<()> {
         let Some(running_turn) = self.running_turn.take() else {
             self.flush_pending_message(cx);
+            self.flush_pending_reports(cx);
             return Task::ready(());
         };
 
@@ -2397,6 +2404,7 @@ impl Thread {
                 if this.prompt_id == prompt_id {
                     this.flush_pending_message(cx);
                 }
+                this.flush_pending_reports(cx);
             })
             .ok();
         })
@@ -2693,6 +2701,51 @@ impl Thread {
         self.run_turn(cx)
     }
 
+    /// Queues the result of a background subagent for this thread. When the
+    /// thread is idle the report starts a turn right away; while a turn is in
+    /// flight it waits and is folded into the next turn, so a report never
+    /// cancels work the user is waiting on.
+    pub fn deliver_report(
+        &mut self,
+        message: String,
+        cx: &mut Context<Self>,
+    ) -> Option<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+        log::info!("Queuing subagent report for thread {}", self.id);
+        self.pending_reports.push(message);
+        if !self.is_turn_complete() {
+            return None;
+        }
+        self.merge_pending_reports(cx);
+        match self.send_existing(cx) {
+            Ok(events) => Some(events),
+            Err(error) => {
+                log::error!("Could not deliver a subagent report: {error:#}");
+                None
+            }
+        }
+    }
+
+    /// Appends queued subagent reports to the transcript as a user message.
+    fn merge_pending_reports(&mut self, cx: &mut Context<Self>) {
+        if self.pending_reports.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.pending_reports).join("\n\n");
+        let content: Arc<[UserMessageContent]> = vec![UserMessageContent::Text(text)].into();
+        self.upsert_user_message(ClientUserMessageId::new(), content, cx);
+    }
+
+    /// Starts a turn for queued subagent reports when the thread is idle.
+    fn flush_pending_reports(&mut self, cx: &mut Context<Self>) {
+        if self.pending_reports.is_empty() || !self.is_turn_complete() {
+            return;
+        }
+        self.merge_pending_reports(cx);
+        if let Err(error) = self.send_existing(cx) {
+            log::error!("Could not deliver queued subagent reports: {error:#}");
+        }
+    }
+
     /// Force a manual context compaction using the summary strategy,
     /// regardless of the current token usage or context window size.
     pub fn compact(
@@ -2793,7 +2846,11 @@ impl Thread {
                     }
                 }
 
-                _ = this.update(cx, |this, _| this.running_turn.take());
+                _ = this.update(cx, |this, cx| {
+                    this.running_turn.take();
+                    // Deliver any subagent report that arrived during compaction.
+                    this.flush_pending_reports(cx);
+                });
             }
         });
         self.running_turn = Some(RunningTurn::new(
@@ -2859,6 +2916,9 @@ impl Thread {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+        // A report that arrived while the previous turn was running belongs to
+        // this turn rather than a competing one.
+        self.merge_pending_reports(cx);
         // Flush the old pending message synchronously before cancelling,
         // to avoid a race where the detached cancel task might flush the NEW
         // turn's pending message instead of the old one.
@@ -2920,7 +2980,12 @@ impl Thread {
                     }
                 }
 
-                _ = this.update(cx, |this, _| this.running_turn.take());
+                _ = this.update(cx, |this, cx| {
+                    this.running_turn.take();
+                    // A background subagent may have finished while this turn
+                    // was running; deliver its report now that we are idle.
+                    this.flush_pending_reports(cx);
+                });
             }
         });
         self.running_turn = Some(RunningTurn::new(

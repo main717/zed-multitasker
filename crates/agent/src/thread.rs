@@ -1393,10 +1393,9 @@ impl Thread {
             depth: parent_thread.read(cx).depth() + 1,
         });
         thread.inherit_parent_settings(parent_thread, cx);
-        let model_selection = model_selection
-            .cloned()
-            .or_else(|| AgentSettings::get_global(cx).subagent_model.clone());
-        if let Some(model_selection) = model_selection {
+        // Subagents always use the parent thread's current model. Only internal
+        // callers pass an explicit selection.
+        if let Some(model_selection) = model_selection.cloned() {
             thread.inherits_parent_model_settings = false;
             thread.apply_model_selection(&model_selection, cx);
         }
@@ -2367,6 +2366,8 @@ impl Thread {
         }
     }
 
+    /// Stops this thread and every subagent it started. Used when the user
+    /// explicitly stops the thread.
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
         for subagent in self.running_subagents.drain(..) {
             if let Some(subagent) = subagent.upgrade() {
@@ -2376,6 +2377,12 @@ impl Thread {
             }
         }
 
+        self.cancel_turn(cx)
+    }
+
+    /// Stops only the in-flight model turn. Background subagents keep running,
+    /// so a new user message does not kill work they are still doing.
+    pub(crate) fn cancel_turn(&mut self, cx: &mut Context<Self>) -> Task<()> {
         let Some(running_turn) = self.running_turn.take() else {
             self.flush_pending_message(cx);
             return Task::ready(());
@@ -2701,7 +2708,7 @@ impl Thread {
         // start, mirroring `run_turn` so a stray completion can't race with the
         // compaction we're about to perform.
         self.flush_pending_message(cx);
-        self.cancel(cx).detach();
+        self.cancel_turn(cx).detach();
 
         let accepted_marker_index = self.messages.iter().position(
             |message| matches!(message.as_ref(), Message::User(user) if user.id == id && user.content.is_empty()),
@@ -2856,7 +2863,7 @@ impl Thread {
         // to avoid a race where the detached cancel task might flush the NEW
         // turn's pending message instead of the old one.
         self.flush_pending_message(cx);
-        self.cancel(cx).detach();
+        self.cancel_turn(cx).detach();
 
         let (events_tx, events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
         let event_stream = ThreadEventStream::new(events_tx);

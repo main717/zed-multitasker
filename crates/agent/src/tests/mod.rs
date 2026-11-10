@@ -5983,7 +5983,7 @@ async fn test_ask_user_elicitation_references_scoped_tool_call_id(cx: &mut TestA
 }
 
 #[gpui::test]
-async fn test_spawn_agent_tool_forwards_explicit_model(cx: &mut TestAppContext) {
+async fn test_spawn_agent_tool_always_uses_parent_model(cx: &mut TestAppContext) {
     init_test(cx);
 
     let environment = Rc::new(
@@ -5996,63 +5996,22 @@ async fn test_spawn_agent_tool_forwards_explicit_model(cx: &mut TestAppContext) 
     let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
     let (event_stream, _rx) = ToolCallEventStream::test();
 
+    // A stale model override in the raw tool input is ignored: the subagent
+    // always inherits the parent thread's current model.
+    let input = serde_json::json!({
+        "label": "task",
+        "message": "prompt",
+        "model": "fake-corp/cheap-model",
+        "background": false,
+    });
+    let input: SpawnAgentToolInput = serde_json::from_value(input).unwrap();
+
     let result = cx
-        .update(|cx| {
-            tool.run(
-                ToolInput::resolved(SpawnAgentToolInput {
-                    label: "task".to_string(),
-                    message: "prompt".to_string(),
-                    session_id: None,
-                    model: Some("fake-corp/cheap-model".to_string()),
-                    background: false,
-                }),
-                event_stream,
-                cx,
-            )
-        })
+        .update(|cx| tool.run(ToolInput::resolved(input), event_stream, cx))
         .await;
 
     assert!(matches!(result, Ok(SpawnAgentToolOutput::Success { .. })));
-    assert_eq!(
-        environment.subagent_models(),
-        vec![Some(AgentModelId::from(
-            "fake-corp/cheap-model".to_string()
-        ))]
-    );
-}
-
-#[gpui::test]
-async fn test_spawn_agent_tool_rejects_model_when_resuming(cx: &mut TestAppContext) {
-    init_test(cx);
-
-    let environment = Rc::new(FakeThreadEnvironment::default());
-    #[allow(clippy::arc_with_non_send_sync)]
-    let tool = Arc::new(SpawnAgentTool::new(environment));
-    let (event_stream, _rx) = ToolCallEventStream::test();
-
-    let result = cx
-        .update(|cx| {
-            tool.run(
-                ToolInput::resolved(SpawnAgentToolInput {
-                    label: "task".to_string(),
-                    message: "prompt".to_string(),
-                    session_id: Some(acp_v2::SessionId::new("subagent-id")),
-                    model: Some("fake-corp/other-model".to_string()),
-                    background: false,
-                }),
-                event_stream,
-                cx,
-            )
-        })
-        .await;
-
-    let Err(SpawnAgentToolOutput::Error { error, .. }) = result else {
-        panic!("expected model override on resumed session to fail");
-    };
-    assert_eq!(
-        error,
-        "model cannot be changed when resuming a subagent session"
-    );
+    assert_eq!(environment.subagent_models(), vec![None]);
 }
 
 #[gpui::test]
@@ -6084,7 +6043,6 @@ async fn test_spawn_agent_tool_background_returns_before_subagent_finishes(
                     label: "task".to_string(),
                     message: "prompt".to_string(),
                     session_id: None,
-                    model: None,
                     background: true,
                 }),
                 event_stream,
@@ -6166,7 +6124,6 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
-        model: None,
         background: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
@@ -6316,7 +6273,6 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
-        model: None,
         background: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
@@ -6476,7 +6432,6 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
-        model: None,
         background: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
@@ -6615,7 +6570,6 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         label: "initial task".to_string(),
         message: "do the first task".to_string(),
         session_id: None,
-        model: None,
         background: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
@@ -6688,7 +6642,6 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         label: "follow-up task".to_string(),
         message: "do the follow-up task".to_string(),
         session_id: Some(subagent_session_id.clone()),
-        model: None,
         background: false,
     };
     let resume_tool_use = LanguageModelToolUse {
@@ -6880,13 +6833,22 @@ async fn test_subagent_thread_model_selection(cx: &mut TestAppContext) {
     let explicit_subagent_thread =
         cx.new(|cx| Thread::new_subagent(&parent_thread, Some(&explicit_selection), cx));
 
-    subagent_thread.read_with(cx, |subagent_thread, _cx| {
+    subagent_thread.read_with(cx, |subagent_thread, cx| {
+        let parent = parent_thread.read(cx);
         assert_eq!(
             subagent_thread.model().map(|model| model.id()),
-            Some(subagent_model.id())
+            Some(parent_model.id())
         );
-        assert!(subagent_thread.thinking_enabled());
-        assert_eq!(subagent_thread.thinking_effort(), Some(&"high".to_string()));
+        assert_ne!(
+            subagent_thread.model().map(|model| model.id()),
+            Some(subagent_model.id()),
+            "subagent_model is deprecated and must not be used"
+        );
+        assert_eq!(
+            subagent_thread.thinking_enabled(),
+            parent.thinking_enabled()
+        );
+        assert_eq!(subagent_thread.thinking_effort(), parent.thinking_effort());
     });
 
     explicit_subagent_thread.read_with(cx, |subagent_thread, _cx| {
@@ -6911,10 +6873,10 @@ async fn test_subagent_thread_model_selection(cx: &mut TestAppContext) {
     subagent_thread.read_with(cx, |subagent_thread, _cx| {
         assert_eq!(
             subagent_thread.model().map(|model| model.id()),
-            Some(subagent_model.id())
+            Some(parent_model.id())
         );
-        assert!(subagent_thread.thinking_enabled());
-        assert_eq!(subagent_thread.thinking_effort(), Some(&"high".to_string()));
+        assert!(!subagent_thread.thinking_enabled());
+        assert_eq!(subagent_thread.thinking_effort(), None);
     });
     explicit_subagent_thread.read_with(cx, |subagent_thread, _cx| {
         assert_eq!(
@@ -7658,7 +7620,6 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
-        model: None,
         background: false,
     };
     let subagent_tool_use = LanguageModelToolUse {

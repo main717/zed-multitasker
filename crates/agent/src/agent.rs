@@ -2654,7 +2654,14 @@ impl NativeAgentConnection {
                     let model_started = !thread.read_with(cx, |thread, _cx| thread.is_turn_complete());
                     // Tools may ignore cancellation. Their native cleanup must not
                     // delay the bridge's Stop event or the next accepted prompt.
-                    thread.update(cx, |thread, cx| thread.cancel(cx)).detach();
+                    // A follow-up message only interrupts this turn; background
+                    // subagents keep running unless the user explicitly cancels.
+                    thread
+                        .update(cx, |thread, cx| match cancellation {
+                            NativeCancellation::InterruptedByFollowUp => thread.cancel_turn(cx),
+                            NativeCancellation::Cancelled => thread.cancel(cx),
+                        })
+                        .detach();
                     if model_started {
                         // Drain cancellation updates (including compaction terminalization)
                         // before publishing Idle or allowing another submission to insert.
@@ -3142,20 +3149,6 @@ impl acp_thread::AgentModelSelector for NativeAgentModelSelector {
     }
 }
 
-fn subagent_model_id_to_selection(model_id: &AgentModelId, cx: &App) -> LanguageModelSelection {
-    let settings = agent_settings::AgentSettings::get_global(cx);
-    let Some((provider, model)) = model_id.as_ref().split_once('/') else {
-        return model_id_to_selection(model_id, cx);
-    };
-    if let Some(selection) = settings.subagent_model.as_ref()
-        && selection.provider.0 == provider
-        && selection.model == model
-    {
-        return selection.clone();
-    }
-    model_id_to_selection(model_id, cx)
-}
-
 fn model_id_to_selection(model_id: &AgentModelId, cx: &App) -> LanguageModelSelection {
     let id = model_id.as_ref();
     let (provider, model) = id.split_once('/').unwrap_or(("", id));
@@ -3632,7 +3625,7 @@ impl NativeThreadEnvironment {
                     "Model {model_id} is unavailable. Call list_agents_and_models to inspect available models."
                 );
             }
-            Some(subagent_model_id_to_selection(&model_id, cx))
+            Some(model_id_to_selection(&model_id, cx))
         } else {
             None
         };
@@ -4394,7 +4387,7 @@ mod internal_tests {
     }
 
     #[gpui::test]
-    async fn test_explicit_subagent_model_preserves_configured_settings(cx: &mut TestAppContext) {
+    async fn test_explicit_subagent_model_ignores_configured_subagent_model(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(path!("/test"), json!({})).await;
@@ -4455,10 +4448,10 @@ mod internal_tests {
         });
         subagent_thread.read_with(cx, |thread, _| {
             assert_eq!(thread.model().map(|model| model.id()), Some(model.id()));
+            // `subagent_model` is deprecated and ignored, so its thinking effort and
+            // speed never leak into a subagent.
             assert!(thread.thinking_enabled());
-            assert_eq!(thread.thinking_effort(), Some(&"high".to_string()));
-            // The fake model does not support fast mode, so the configured speed is
-            // intentionally filtered while the model selection is applied.
+            assert_eq!(thread.thinking_effort(), None);
             assert_eq!(thread.speed(), None);
         });
     }

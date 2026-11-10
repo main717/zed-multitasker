@@ -282,9 +282,9 @@ pub struct AgentSettingsContent {
     pub max_content_width: Option<crate::PixelSetting>,
     /// The default model to use when creating new chats and for other features when a specific model is not specified.
     pub default_model: Option<LanguageModelSelection>,
-    /// Model to use for subagents. Defaults to the parent thread's model and its
-    /// thinking, effort, and speed settings when not specified. If the configured
-    /// model is unavailable, the parent thread's model is used instead.
+    /// Model to use for subagents. Deprecated and ignored: subagents always
+    /// use the parent thread's model together with its thinking, effort, and
+    /// speed settings.
     pub subagent_model: Option<LanguageModelSelection>,
     /// Favorite models to show at the top of the model selector.
     #[serde(default)]

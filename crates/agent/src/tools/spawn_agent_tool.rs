@@ -8,8 +8,6 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use acp_thread::AgentModelId;
-
 use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 
 /// Spawn a sub-agent for a well-scoped task.
@@ -32,12 +30,6 @@ use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 /// - When a plan has multiple independent steps, prefer delegating those steps in parallel rather than serializing them unnecessarily.
 /// - Reuse the returned session_id when you want to follow up on the same delegated subproblem instead of creating a duplicate session.
 ///
-/// ### Model selection
-/// - When the user requests a particular model or asks you to choose based on cost or capability, call `list_agents_and_models` first, then pass the exact `models[].id` from the native Zed agent entry (`is_native: true`) in `model`.
-/// - Omit `model` to use the user's configured subagent model, or the parent model when no subagent model is configured.
-/// - Do not silently choose a different model when an explicit model is unavailable unless the user allowed fallback.
-/// - A resumed session keeps its existing model, so `model` cannot be combined with `session_id`.
-///
 /// ### Output
 /// - By default the subagent runs in the background: this call returns a session_id
 ///   immediately and the subagent's result is delivered to this thread as a new
@@ -55,11 +47,6 @@ pub struct SpawnAgentToolInput {
     /// Session ID of an existing agent session to continue instead of creating a new one. Omit to create a new agent.
     #[serde(default, deserialize_with = "deserialize_session_id")]
     pub session_id: Option<acp_v2::SessionId>,
-    /// Optional model override. Pass the exact `models[].id` returned for the
-    /// native Zed agent (`is_native: true`) by `list_agents_and_models`.
-    /// Omit to preserve default behavior.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
     /// Run the subagent in the background and return immediately. Defaults to true:
     /// the result is delivered to this thread as a message when the subagent
     /// finishes, so the thread stays usable meanwhile. Pass false only when the
@@ -209,7 +196,6 @@ impl AgentTool for SpawnAgentTool {
                 label,
                 message,
                 session_id,
-                model,
                 background,
             } = input;
             // `label` is moved into `create_subagent`, so keep a copy for the
@@ -217,15 +203,9 @@ impl AgentTool for SpawnAgentTool {
             let report_label = label.clone();
 
             let (subagent, mut session_info) = cx.update(|cx| {
-                let subagent = match (session_id, model) {
-                    (Some(_), Some(_)) => Err(anyhow::anyhow!(
-                        "model cannot be changed when resuming a subagent session"
-                    )),
-                    (Some(session_id), None) => self.environment.resume_subagent(session_id, cx),
-                    (None, model) => {
-                        self.environment
-                            .create_subagent(label, model.map(AgentModelId::from), cx)
-                    }
+                let subagent = match session_id {
+                    Some(session_id) => self.environment.resume_subagent(session_id, cx),
+                    None => self.environment.create_subagent(label, None, cx),
                 };
                 let subagent = subagent.map_err(|err| SpawnAgentToolOutput::Error {
                     session_id: None,
@@ -259,7 +239,9 @@ impl AgentTool for SpawnAgentTool {
                 );
                 cx.spawn(async move |cx| {
                     let body = match subagent.send(message, cx).await {
-                        Ok(output) => format!("[subagent '{}' finished]\n\n{}", report_label, output),
+                        Ok(output) => {
+                            format!("[subagent '{}' finished]\n\n{}", report_label, output)
+                        }
                         Err(error) => format!("[subagent '{}' failed]\n\n{error:#}", report_label),
                     };
                     if let Err(error) = environment.deliver_to_parent(body, cx).await {
@@ -350,9 +332,7 @@ impl AgentTool for SpawnAgentTool {
                 ..
             } => (error.into(), session_info),
             SpawnAgentToolOutput::Running {
-                note,
-                session_info,
-                ..
+                note, session_info, ..
             } => (note.into(), Some(session_info)),
         };
 

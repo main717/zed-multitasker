@@ -826,6 +826,15 @@ pub trait ThreadEnvironment {
             "Listing available agents is not supported in this environment"
         ))
     }
+
+    /// Delivers a message to the parent thread once it is idle, so a background
+    /// subagent can report its result without blocking the tool call that started
+    /// it. Implementations must not cancel an in-flight turn.
+    fn deliver_to_parent(&self, _message: String, _cx: &mut AsyncApp) -> Task<Result<()>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "Delivering messages to the parent thread is not supported in this environment"
+        )))
+    }
 }
 
 /// A request to create a new sibling thread.

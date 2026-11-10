@@ -39,7 +39,10 @@ use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 /// - A resumed session keeps its existing model, so `model` cannot be combined with `session_id`.
 ///
 /// ### Output
-/// - You will receive only the agent's final message as output.
+/// - By default the subagent runs in the background: this call returns a session_id
+///   immediately and the subagent's result is delivered to this thread as a new
+///   message when it finishes. Continue with other work or reply to the user now.
+/// - Pass `background: false` only when you need the result inside this same tool call.
 /// - Successful calls return a session_id that you can use for follow-up messages.
 /// - Error results may also include a session_id if a session was already created.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -57,6 +60,16 @@ pub struct SpawnAgentToolInput {
     /// Omit to preserve default behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Run the subagent in the background and return immediately. Defaults to true:
+    /// the result is delivered to this thread as a message when the subagent
+    /// finishes, so the thread stays usable meanwhile. Pass false only when the
+    /// result is needed inside this same tool call.
+    #[serde(default = "default_background")]
+    pub background: bool,
+}
+
+fn default_background() -> bool {
+    true
 }
 
 fn deserialize_session_id<'de, D>(deserializer: D) -> Result<Option<acp_v2::SessionId>, D::Error>
@@ -95,11 +108,29 @@ pub enum SpawnAgentToolOutput {
         error: String,
         session_info: Option<SubagentSessionInfo>,
     },
+    /// The subagent was started in the background. Its result arrives later as a
+    /// separate message in this thread.
+    Running {
+        session_id: acp_v2::SessionId,
+        note: String,
+        session_info: SubagentSessionInfo,
+    },
 }
 
 impl From<SpawnAgentToolOutput> for LanguageModelToolResultContent {
     fn from(output: SpawnAgentToolOutput) -> Self {
         match output {
+            SpawnAgentToolOutput::Running {
+                session_id,
+                note,
+                session_info: _, // Don't show this to the model
+            } => serde_json::to_string(&serde_json::json!({
+                "session_id": session_id,
+                "status": "running",
+                "note": note,
+            }))
+            .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
+            .into(),
             SpawnAgentToolOutput::Success {
                 session_id,
                 output,
@@ -179,7 +210,12 @@ impl AgentTool for SpawnAgentTool {
                 message,
                 session_id,
                 model,
+                background,
             } = input;
+            // `label` is moved into `create_subagent`, so keep a copy for the
+            // background report before the environment consumes it.
+            let report_label = label.clone();
+
             let (subagent, mut session_info) = cx.update(|cx| {
                 let subagent = match (session_id, model) {
                     (Some(_), Some(_)) => Err(anyhow::anyhow!(
@@ -211,6 +247,36 @@ impl AgentTool for SpawnAgentTool {
 
                 Ok((subagent, session_info))
             })?;
+
+            if background {
+                let environment = self.environment.clone();
+                let session_id = subagent.id();
+                let note = format!(
+                    "Subagent '{}' is running in the background. Do not wait for it. Its \
+                     result will be delivered to this thread as a new message when it \
+                     finishes. Continue with other work or answer the user now.",
+                    report_label
+                );
+                cx.spawn(async move |cx| {
+                    let body = match subagent.send(message, cx).await {
+                        Ok(output) => format!("[subagent '{}' finished]\n\n{}", report_label, output),
+                        Err(error) => format!("[subagent '{}' failed]\n\n{error:#}", report_label),
+                    };
+                    if let Err(error) = environment.deliver_to_parent(body, cx).await {
+                        log::error!(
+                            "Could not deliver the result of subagent '{}': {error:#}",
+                            report_label
+                        );
+                    }
+                })
+                .detach();
+
+                return Ok(SpawnAgentToolOutput::Running {
+                    session_id,
+                    note,
+                    session_info,
+                });
+            }
 
             let send_result = subagent.send(message, cx).await;
 
@@ -283,6 +349,11 @@ impl AgentTool for SpawnAgentTool {
                 session_info,
                 ..
             } => (error.into(), session_info),
+            SpawnAgentToolOutput::Running {
+                note,
+                session_info,
+                ..
+            } => (note.into(), Some(session_info)),
         };
 
         let meta = session_info.map(|session_info| {

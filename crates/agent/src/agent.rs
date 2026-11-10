@@ -3738,6 +3738,36 @@ impl NativeThreadEnvironment {
 }
 
 impl ThreadEnvironment for NativeThreadEnvironment {
+    fn deliver_to_parent(&self, message: String, cx: &mut AsyncApp) -> Task<Result<()>> {
+        let thread = self.thread.clone();
+        cx.spawn(async move |cx| {
+            // Thread::send cancels a running turn, so wait for the parent to go
+            // idle first. A subagent finishing mid-turn must not kill the work
+            // the orchestrator is still streaming.
+            loop {
+                let idle = thread.read_with(cx, |thread, _cx| thread.is_turn_complete())?;
+                if idle {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
+            }
+
+            let events = thread.update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), [message], cx)
+            })?;
+            let mut events = events?;
+            while let Ok(event) = events.recv().await {
+                if let Err(error) = event {
+                    log::error!("Background subagent report turn failed: {error:#}");
+                    break;
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn create_terminal(
         &self,
         command: String,

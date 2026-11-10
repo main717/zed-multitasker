@@ -195,6 +195,7 @@ pub(crate) struct FakeThreadEnvironment {
     terminal_creations: Arc<AtomicUsize>,
     terminal_output_limits: std::cell::RefCell<Vec<Option<u64>>>,
     subagent_models: std::cell::RefCell<Vec<Option<AgentModelId>>>,
+    delivered_messages: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl FakeThreadEnvironment {
@@ -223,9 +224,18 @@ impl FakeThreadEnvironment {
     fn subagent_models(&self) -> Vec<Option<AgentModelId>> {
         self.subagent_models.borrow().clone()
     }
+
+    fn delivered_messages(&self) -> Vec<String> {
+        self.delivered_messages.lock().unwrap().clone()
+    }
 }
 
 impl crate::ThreadEnvironment for FakeThreadEnvironment {
+    fn deliver_to_parent(&self, message: String, _cx: &mut AsyncApp) -> Task<Result<()>> {
+        self.delivered_messages.lock().unwrap().push(message);
+        Task::ready(Ok(()))
+    }
+
     fn create_terminal(
         &self,
         _command: String,
@@ -5994,6 +6004,7 @@ async fn test_spawn_agent_tool_forwards_explicit_model(cx: &mut TestAppContext) 
                     message: "prompt".to_string(),
                     session_id: None,
                     model: Some("fake-corp/cheap-model".to_string()),
+                    background: false,
                 }),
                 event_stream,
                 cx,
@@ -6027,6 +6038,7 @@ async fn test_spawn_agent_tool_rejects_model_when_resuming(cx: &mut TestAppConte
                     message: "prompt".to_string(),
                     session_id: Some(acp_v2::SessionId::new("subagent-id")),
                     model: Some("fake-corp/other-model".to_string()),
+                    background: false,
                 }),
                 event_stream,
                 cx,
@@ -6040,6 +6052,64 @@ async fn test_spawn_agent_tool_rejects_model_when_resuming(cx: &mut TestAppConte
     assert_eq!(
         error,
         "model cannot be changed when resuming a subagent session"
+    );
+}
+
+#[gpui::test]
+async fn test_spawn_agent_tool_background_returns_before_subagent_finishes(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let (completion_tx, completion_rx) = oneshot::channel::<String>();
+    let send_task = cx.update(|cx| {
+        cx.spawn(async move |_cx| completion_rx.await.unwrap_or_default())
+            .shared()
+    });
+
+    let environment = Rc::new(
+        FakeThreadEnvironment::default().with_subagent(FakeSubagentHandle {
+            session_id: acp_v2::SessionId::new("subagent-id"),
+            send_task,
+        }),
+    );
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(SpawnAgentTool::new(environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+
+    let result = cx
+        .update(|cx| {
+            tool.run(
+                ToolInput::resolved(SpawnAgentToolInput {
+                    label: "task".to_string(),
+                    message: "prompt".to_string(),
+                    session_id: None,
+                    model: None,
+                    background: true,
+                }),
+                event_stream,
+                cx,
+            )
+        })
+        .await;
+
+    assert!(
+        matches!(result, Ok(SpawnAgentToolOutput::Running { .. })),
+        "a background subagent must return before its work finishes"
+    );
+    cx.run_until_parked();
+    assert!(
+        environment.delivered_messages().is_empty(),
+        "the parent must not receive a result while the subagent is still running"
+    );
+
+    completion_tx.send("subagent done".to_string()).unwrap();
+    cx.run_until_parked();
+
+    assert_eq!(
+        environment.delivered_messages(),
+        vec!["[subagent 'task' finished]\n\nsubagent done".to_string()],
+        "the finished subagent must report its result to the parent thread"
     );
 }
 
@@ -6097,6 +6167,7 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
         message: "subagent task prompt".to_string(),
         session_id: None,
         model: None,
+        background: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6246,6 +6317,7 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
         message: "subagent task prompt".to_string(),
         session_id: None,
         model: None,
+        background: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6405,6 +6477,7 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
         message: "subagent task prompt".to_string(),
         session_id: None,
         model: None,
+        background: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6543,6 +6616,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         message: "do the first task".to_string(),
         session_id: None,
         model: None,
+        background: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6615,6 +6689,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         message: "do the follow-up task".to_string(),
         session_id: Some(subagent_session_id.clone()),
         model: None,
+        background: false,
     };
     let resume_tool_use = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -7584,6 +7659,7 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
         message: "subagent task prompt".to_string(),
         session_id: None,
         model: None,
+        background: false,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
